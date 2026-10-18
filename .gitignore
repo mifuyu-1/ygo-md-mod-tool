@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 打包产物
+build/
+dist/
+*.exe
+
+# 运行时生成的数据（每台机器本地生成，不进仓库）
+_MD卡图备份/
+card_index.sqlite
+game_card_names.json
+card_names_full.json
+cards.json
+config.json
+
+# 本地 Mod 文件（他人作品/版权内容，禁止上传）
+mod下载文件/
+
+# IDE
+.idea/
+.vscode/
