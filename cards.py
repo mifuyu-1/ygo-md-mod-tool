@@ -9,6 +9,8 @@
   local  = LocalData\\<玩家>\\0000（按需下载）
   stream = masterduel_Data\\StreamingAssets\\AssetBundle（随安装包下发，含老牌经典卡）
 """
+import hashlib
+import io
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,7 +21,7 @@ from PIL import Image
 from UnityPy.enums import ClassIDType
 
 from core import (CARDS_JSON, GAME_NAMES_JSON, INDEX_DB, Manifest, Paths,
-                  ROOT_LOCAL, ROOT_STREAM, write_bundle_bytes)
+                  ROOT_LOCAL, ROOT_STREAM, _effective_backup, write_bundle_bytes)
 
 ILLUST_MARKER = "card/images/illust/"
 KIND_RANK = {"common": 0, "tcg": 1, "ocg": 2}
@@ -248,7 +250,26 @@ def get_modded_card_ids(conn, manifest_entries: dict) -> set[str]:
 
 def invalidate_replaced_cache():
     """替换/还原后调用，使缓存失效"""
+    global _name_index_cache
     _modded_cache.clear()
+    _name_index_cache = None
+
+
+def rel_card_map(conn, rels) -> dict[str, str]:
+    """清单相对路径 → 卡号，用于还原时按卡联动全部 Bundle。
+    rel 兼容 local/xx/hash、stream/xx/hash 与旧版裸 xx/hash。"""
+    norm = {r: (r if r.split("/", 1)[0] in (ROOT_LOCAL, ROOT_STREAM)
+                else f"{ROOT_LOCAL}/{r}") for r in rels}
+    vals = list(norm.values())
+    found = {}
+    for i in range(0, len(vals), 400):
+        chunk = vals[i:i + 400]
+        ph = ",".join("?" * len(chunk))
+        for full, cid in conn.execute(
+                f"SELECT root||'/'||rel_path, card_id FROM cards "
+                f"WHERE root||'/'||rel_path IN ({ph})", chunk):
+            found[full] = cid
+    return {r: found[n] for r, n in norm.items() if n in found}
 
 
 # ---------------- 卡图读取与替换 ----------------
@@ -283,6 +304,85 @@ def read_card_art(paths: Paths, root: str, rel: str, path_id: int | None = None)
     return None
 
 
+# ---------------- 同名同图卡号（区域双建档） ----------------
+
+_name_index_cache = None
+
+
+def _name_index() -> dict:
+    """(简中, 英, 日) 全等卡名 → 卡号列表"""
+    global _name_index_cache
+    if _name_index_cache is None:
+        names, _ = load_game_names()
+        idx = {}
+        for cid, v in names.items():
+            key = (v.get("cn", ""), v.get("en", ""), v.get("ja", ""))
+            if not key[0] or key[0] == "未知":
+                continue
+            idx.setdefault(key, []).append(cid)
+        _name_index_cache = idx
+    return _name_index_cache
+
+
+def _bundle_pixel_md5(path: Path, path_id: int | None) -> str | None:
+    """Bundle 内指定贴图的像素 MD5（解码为 RGBA 后计算，与压缩格式无关）"""
+    try:
+        env = UnityPy.load(io.BytesIO(Path(path).read_bytes()))
+        for obj in env.objects:
+            if obj.type != ClassIDType.Texture2D:
+                continue
+            if path_id is not None and obj.path_id != path_id:
+                continue
+            t = obj.read()
+            if t.m_Width != 512 or t.m_Height not in (512, 1024):
+                continue
+            return hashlib.md5(t.image.convert("RGBA").tobytes()).hexdigest()
+    except Exception:
+        return None
+    return None
+
+
+def _row_fingerprint(paths: Paths, row: dict) -> str | None:
+    """卡图行的像素指纹；有备份时读备份，替换后仍能取到原图"""
+    full_rel = f"{row['root']}/{row['rel']}"
+    bak = _effective_backup(paths, full_rel)
+    p = bak if bak.exists() else paths.bundle_path(full_rel)
+    if not p.exists():
+        return None
+    return _bundle_pixel_md5(p, int(row["path_id"]))
+
+
+def same_art_card_ids(paths: Paths, conn, card_id: str,
+                      max_candidates: int = 20) -> list[str]:
+    """找出与 card_id 卡名完全相同、且首选卡图像素完全一致的其它卡号。
+    用于区域双建档（3171/22089 这类）联动替换、联动还原；异画因图不同不会命中。"""
+    names, _ = load_game_names()
+    info = names.get(str(card_id))
+    if not info:
+        return []
+    key = (info.get("cn", ""), info.get("en", ""), info.get("ja", ""))
+    if not key[0] or key[0] == "未知":
+        return []
+    cand = [i for i in _name_index().get(key, []) if i != str(card_id)]
+    if not cand or len(cand) > max_candidates:
+        return []
+    rows = get_card_rows(conn, card_id)
+    if not rows:
+        return []
+    base = _row_fingerprint(paths, rows[0])
+    if not base:
+        return []
+    out = []
+    for cid in cand:
+        for r in get_card_rows(conn, cid):
+            if _row_fingerprint(paths, r) == base:
+                out.append(cid)
+                break
+    return out
+
+
+# ---------------- 卡图写入 ----------------
+
 def _write_texture_rgba32(tex, img: Image.Image):
     """把 PIL 图片写入 Texture2D（RGBA32，保持原尺寸，含 512x1024 竖版图）"""
     img = img.convert("RGBA").resize((tex.m_Width, tex.m_Height), Image.LANCZOS)
@@ -302,38 +402,41 @@ def _write_texture_rgba32(tex, img: Image.Image):
 
 
 def replace_card_art(paths: Paths, manifest: Manifest, conn, card_id: str,
-                     img: Path | Image.Image) -> int:
+                     img: Path | Image.Image, extra_ids: list[str] | None = None) -> int:
     """
     用本地图片替换该卡的全部卡图资源（local/stream、common/tcg/ocg 一并替换，
     保证游戏无论走哪个根/地区版本都显示新图）。各 Bundle 只备份一次。
+    同名同图的其它卡号（区域双建档，如 3171/22089）默认一起替换；异画不受影响。
     img 可以是图片路径，也可以是已裁剪好的 PIL Image。
     返回替换的 Bundle 数。
     """
-    rows = get_card_rows(conn, card_id)
-    if not rows:
-        raise RuntimeError("索引中找不到该卡的卡图资源")
+    ids = [str(card_id)]
+    if extra_ids is None:
+        extra_ids = same_art_card_ids(paths, conn, card_id)
+    ids += [str(i) for i in extra_ids if str(i) != str(card_id)]
     src = img if isinstance(img, Image.Image) else Image.open(img)
     done_keys = set()
     count = 0
-    for row in rows:
-        full_rel = f"{row['root']}/{row['rel']}"
-        if full_rel in done_keys:
-            continue
-        done_keys.add(full_rel)
-        base = paths.data_dir if row["root"] == ROOT_LOCAL else paths.stream_dir
-        bundle = base / row["rel"]
-        if not bundle.exists():
-            continue
-        env = UnityPy.load(str(bundle))
-        tex = _find_texture(env, int(row["path_id"]))
-        if tex is None:
-            continue
-        _write_texture_rgba32(tex, src)
-        data = env.file.save()
-        if isinstance(data, str):
-            data = data.encode("latin-1")
-        write_bundle_bytes(paths, manifest, full_rel, bytes(data))
-        count += 1
+    for cid in ids:
+        for row in get_card_rows(conn, cid):
+            full_rel = f"{row['root']}/{row['rel']}"
+            if full_rel in done_keys:
+                continue
+            done_keys.add(full_rel)
+            base = paths.data_dir if row["root"] == ROOT_LOCAL else paths.stream_dir
+            bundle = base / row["rel"]
+            if not bundle.exists():
+                continue
+            env = UnityPy.load(str(bundle))
+            tex = _find_texture(env, int(row["path_id"]))
+            if tex is None:
+                continue
+            _write_texture_rgba32(tex, src)
+            data = env.file.save()
+            if isinstance(data, str):
+                data = data.encode("latin-1")
+            write_bundle_bytes(paths, manifest, full_rel, bytes(data))
+            count += 1
     return count
 
 
@@ -384,6 +487,12 @@ def sync_mirror_bundles(paths: Paths, manifest: Manifest, mod_files: list[dict],
         if own_conn:
             conn.close()
         return 0
+
+    # 1.5 同名同图卡号联动：mod 只覆盖了一个卡号时，另一个卡号也写入同一张图
+    #     （原图指纹优先取备份，因此即使本包已覆盖也能比对）
+    for cid in list(mod_images):
+        for tid in same_art_card_ids(paths, conn, cid):
+            mod_images.setdefault(tid, mod_images[cid])
 
     # 2. 索引反查这些卡号的全部其他 Bundle
     targets: dict[tuple[str, str], list[tuple[str, int]]] = {}

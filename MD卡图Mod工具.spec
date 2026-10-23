@@ -1,5 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 from PyInstaller.utils.hooks import collect_all
+
+# 以 spec 所在目录为基准解析源码路径，避免从其他目录调用时找不到 app.py
+SPEC_DIR = SPECPATH
 
 datas = []
 binaries = []
@@ -19,8 +23,8 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
-    ['app.py'],
-    pathex=[],
+    [os.path.join(SPEC_DIR, 'app.py')],
+    pathex=[SPEC_DIR],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,

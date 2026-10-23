@@ -207,6 +207,9 @@ def replace_file(paths: Paths, manifest: Manifest, src_file: Path, rel: str, sou
     dst = paths.bundle_path(full_rel)
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src_file, dst)
+    # copy2 会保留 mod 源文件的旧时间戳，统一改为安装时刻，避免预览按 mtime 排序时
+    # 把刚装上的旧 mod 包误判为“旧版 Bundle”
+    dst.touch()
     manifest.record(full_rel, source, added=(status == "added"))
 
 

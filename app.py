@@ -7,6 +7,7 @@ import io
 import queue
 import threading
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -176,8 +177,12 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("MD 卡图 Mod 工具")
-        self.geometry("980x640")
-        self.minsize(900, 560)
+        # 默认高度按屏幕可用空间取较大值，保证卡图替换按钮不被裁掉
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w = min(1100, max(980, sw - 200))
+        h = min(900, max(720, sh - 160))
+        self.geometry(f"{w}x{h}")
+        self.minsize(900, 680)
 
         self.cfg = core.load_config()
         root = self.cfg.get("game_root")
@@ -583,7 +588,7 @@ class PackTab(ttk.Frame):
                 cards.invalidate_replaced_cache()
                 msg = f"已替换 {replaced} 个文件。"
                 if mirrors:
-                    msg += f"\n额外同步了 {mirrors} 个镜像 Bundle（同一卡图的其他格式版本）。"
+                    msg += f"\n额外同步了 {mirrors} 个镜像 Bundle（其他版本/同名同图卡号）。"
                 messagebox.showinfo("完成", msg)
             self.app.refresh_status()
             self.app.restore_tab.refresh()
@@ -781,6 +786,12 @@ class CropDialog(tk.Toplevel):
 
 # ================= Tab2: 卡图浏览换图 =================
 
+# 卡图版本显示模式：跟随游戏语言 / 固定某一地区 / 并排对比
+ART_MODES = [("自动（跟随语言）", "auto"), ("TCG", "tcg"),
+             ("OCG", "ocg"), ("并排对比", "both")]
+KIND_LABEL = {"tcg": "TCG（和谐版）", "ocg": "OCG（原版）"}
+
+
 def _attach_entry_menu(entry: tk.Entry, readonly: bool = False):
     """给输入框挂右键菜单：剪切/复制/粘贴/全选（readonly 时只有复制/全选）"""
     menu = tk.Menu(entry, tearoff=0)
@@ -820,7 +831,6 @@ class CardTab(ttk.Frame):
         self.names_full, self.ordered_ids = cards.load_game_names()
         self.current_row = None   # 首选卡图资源 {root, rel, path_id,...}
         self.current_card = None
-        self._tk_img = None
         self._lang = tk.StringVar(value="cn")  # 默认中文
         self._search_idx = None  # [(card_id, pref_row, blob)] 全语言卡名+卡号，用于搜索
         self._modded_ids = set()
@@ -893,9 +903,36 @@ class CardTab(ttk.Frame):
         right = ttk.Frame(body, width=300)
         right.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
         right.pack_propagate(False)
-        ttk.Label(right, text="当前卡图预览:").pack(anchor=tk.W)
-        self.preview = ttk.Label(right)
-        self.preview.pack(pady=6)
+        head = ttk.Frame(right)
+        head.pack(fill=tk.X)
+        ttk.Label(head, text="当前卡图预览:").pack(side=tk.LEFT)
+        # 和谐卡（tcg/ocg 双版本）可按游戏语言展示，也可并排对比
+        self._art_mode = tk.StringVar(value=ART_MODES[0][0])
+        mode_cb = ttk.Combobox(head, textvariable=self._art_mode, state="readonly",
+                               width=13, values=[m[0] for m in ART_MODES])
+        mode_cb.pack(side=tk.RIGHT)
+        mode_cb.bind("<<ComboboxSelected>>", lambda _e: self._refresh_view())
+        self.preview_box = ttk.Frame(right)
+        # 底部操作区先从下往上占位，窗口较矮时优先保证按钮可见
+        self.replace_btn = ttk.Button(right, text="选择本地图片替换此卡图",
+                                      command=self.replace_art)
+        self.replace_btn.pack(side=tk.BOTTOM, fill=tk.X, pady=2)
+        ttk.Button(right, text="导出当前卡图为 PNG",
+                   command=self.export_art).pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 2))
+        self._pv_cells, self._pv_labels, self._pv_caps = [], [], []
+        for _i in range(2):
+            cell = ttk.Frame(self.preview_box)
+            lbl = ttk.Label(cell)
+            lbl.pack()
+            cap = ttk.Label(cell, text="")
+            cap.pack()
+            cell.grid(row=0, column=_i, padx=3)
+            cell.grid_remove()
+            self._pv_cells.append(cell)
+            self._pv_labels.append(lbl)
+            self._pv_caps.append(cap)
+        self._pv_photos = []
+        self.preview_box.pack(pady=6)
         # 卡名：只读输入框，可用鼠标拖选、右键复制
         self.name_var = tk.StringVar()
         name_e = tk.Entry(right, textvariable=self.name_var, state="readonly",
@@ -905,11 +942,6 @@ class CardTab(ttk.Frame):
         _attach_entry_menu(name_e, readonly=True)
         self.info_var = tk.StringVar(value="未选择卡片")
         ttk.Label(right, textvariable=self.info_var, wraplength=280).pack(anchor=tk.W)
-        ttk.Button(right, text="导出当前卡图为 PNG",
-                   command=self.export_art).pack(fill=tk.X, pady=(12, 2))
-        self.replace_btn = ttk.Button(right, text="选择本地图片替换此卡图",
-                                      command=self.replace_art)
-        self.replace_btn.pack(fill=tk.X, pady=2)
 
         self._try_open_db()
 
@@ -1058,10 +1090,10 @@ class CardTab(ttk.Frame):
         return self.names.get(cid, "")  # 回退到旧卡名库
 
     def _on_lang_change(self):
-        """切换语言：左侧列表卡名重渲染；右侧已选中卡的卡名同步刷新（卡图与语言无关，不重读）"""
+        """切换语言：列表与右侧卡名刷新；和谐卡按语言切换 TCG/OCG 版本"""
         self.search()
-        if self.current_card:
-            self.name_var.set(self._get_name(self.current_card))
+        if self.current_card and self.conn is not None:
+            self._show_card(self.current_card)
 
     def _render_page(self):
         rows = self._all_rows
@@ -1075,39 +1107,122 @@ class CardTab(ttk.Frame):
                 cid, self._get_name(cid), "●已改" if is_mod else ""))
         self.page_var.set(f"第 {start+1}-{end} / {total} 张  (第 {self._page+1}/{(total-1)//self._page_size+1} 页)" if total else "无结果")
 
-    def on_select(self, _evt):
+    def on_select(self, _evt=None):
         sel = self.tree.selection()
         if not sel or self.conn is None:
             return
-        vals = self.tree.item(sel[0], "values")
-        cid = str(vals[0])
-        card_rows = cards.get_card_rows(self.conn, cid)
+        self._show_card(str(self.tree.item(sel[0], "values")[0]))
+
+    def _show_card(self, cid):
+        """按当前语言与版本模式刷新右侧预览
+        （游戏按语言选择和谐版/原版：日语用 OCG，其余语言用 TCG）"""
+        card_rows = self._sorted_rows(cards.get_card_rows(self.conn, cid))
         if not card_rows:
             return
-        row = card_rows[0]
-        self.current_card, self.current_row = cid, row
-        loc = "基础资源" if row["root"] == "stream" else "下载数据"
-        self.name_var.set("")
-        self.info_var.set(f"卡号 {cid} | {loc} {row['rel']} | {row['w']}x{row['h']}\n读取中...")
-        self.update_idletasks()
-        try:
-            img = cards.read_card_art(self.app.paths, row["root"], row["rel"],
-                                      row["path_id"])
-            if img:
-                disp = img.copy()
-                disp.thumbnail((280, 280))
-                from PIL import ImageTk
-                self._tk_img = ImageTk.PhotoImage(disp)
-                self.preview.config(image=self._tk_img)
-                self.name_var.set(self._get_name(cid))
-                extra = f"，共 {len(card_rows)} 个资源" if len(card_rows) > 1 else ""
-                self.info_var.set(
-                    f"卡号 {cid}\n{loc} {row['rel']} ({row['w']}x{row['h']}){extra}")
+        rows = self._pick_rows(card_rows)
+        self.current_card, self.current_row = cid, rows[0]
+        self.name_var.set(self._get_name(cid))
+        self._show_images(rows, card_rows)
+        loc = lambda r: "基础资源" if r["root"] == "stream" else "下载数据"
+
+        def desc(r):
+            s = f"{loc(r)} {r['rel']} ({r['w']}x{r['h']})"
+            if len(card_rows) > 1:
+                s += f" · {self._fmt_date(r.get('mtime', 0))}"
+            return s
+
+        if len(rows) == 1:
+            body = desc(rows[0])
+        else:
+            body = "\n".join(f"{KIND_LABEL.get(r['kind'], r['kind'])} {desc(r)}"
+                             for r in rows)
+        extra = f"，共 {len(card_rows)} 个资源" if len(card_rows) > 1 else ""
+        self.info_var.set(f"卡号 {cid}{extra}\n{body}")
+
+    def _sorted_rows(self, rows):
+        """同 root/kind 内按 Bundle 文件修改时间新→旧，避免预览顺序依赖索引写入顺序"""
+        for r in rows:
+            try:
+                r["mtime"] = self.app.paths.bundle_path(
+                    f"{r['root']}/{r['rel']}").stat().st_mtime
+            except OSError:
+                r["mtime"] = 0
+        rows.sort(key=lambda r: (cards.ROOT_RANK.get(r["root"], 9),
+                                 cards.KIND_RANK.get(r["kind"], 9),
+                                 -r["mtime"]))
+        return rows
+
+    @staticmethod
+    def _fmt_date(ts) -> str:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else "?"
+
+    def _bundle_tag(self, row, card_rows) -> str:
+        """同 root/kind 有多份 Bundle 时标注 新版/旧版（按修改时间）"""
+        same = [r for r in card_rows
+                if r["root"] == row["root"] and r["kind"] == row["kind"]]
+        if len(same) < 2:
+            return ""
+        idx = next((i for i, r in enumerate(same) if r is row), 0)
+        return "新版 Bundle" if idx == 0 else "旧版 Bundle"
+
+    def _pick_rows(self, card_rows) -> list[dict]:
+        """按显示模式返回要展示的 1~2 个资源行"""
+        mode = dict(ART_MODES)[self._art_mode.get()]
+        tcg = next((r for r in card_rows if r["kind"] == "tcg"), None)
+        ocg = next((r for r in card_rows if r["kind"] == "ocg"), None)
+        if mode == "both":
+            both = [r for r in (tcg, ocg) if r]
+            return both or [self._auto_row(card_rows, tcg, ocg)]
+        if mode == "tcg":
+            return [tcg or card_rows[0]]
+        if mode == "ocg":
+            return [ocg or card_rows[0]]
+        return [self._auto_row(card_rows, tcg, ocg)]
+
+    def _auto_row(self, card_rows, tcg=None, ocg=None):
+        """跟随语言：日语用 OCG 原版，其余语言用 TCG（和谐版）"""
+        tcg = tcg or next((r for r in card_rows if r["kind"] == "tcg"), None)
+        ocg = ocg or next((r for r in card_rows if r["kind"] == "ocg"), None)
+        if self._lang.get() == "jp" and ocg:
+            return ocg
+        return tcg or ocg or card_rows[0]
+
+    def _show_images(self, rows, card_rows):
+        """渲染 1 张大图，或并排 2 张小图并标注 TCG/OCG、新版/旧版"""
+        for i, cell in enumerate(self._pv_cells):
+            cell.grid_remove()
+            self._pv_caps[i].config(text="")
+        self._pv_photos = []
+        both = len(rows) > 1
+        size = 132 if both else 280
+        for i, row in enumerate(rows[:2]):
+            cell = self._pv_cells[i]
+            cell.grid(row=0, column=i, padx=3)
+            tag = self._bundle_tag(row, card_rows)
+            if both:
+                cap = KIND_LABEL.get(row["kind"], "")
+                cap += f" · {tag}" if tag else ""
             else:
-                self.preview.config(image="")
-                self.info_var.set("无法读取卡图")
-        except Exception as e:
-            self.info_var.set(f"读取失败: {e}")
+                cap = tag
+            self._pv_caps[i].config(text=cap)
+            try:
+                img = cards.read_card_art(self.app.paths, row["root"], row["rel"],
+                                          row["path_id"])
+            except Exception:
+                img = None
+            if img is None:
+                self._pv_labels[i].config(image="", text="无法读取卡图")
+            else:
+                disp = img.copy()
+                disp.thumbnail((size, size))
+                ph = ImageTk.PhotoImage(disp)
+                self._pv_photos.append(ph)
+                self._pv_labels[i].config(image=ph, text="")
+
+    def _refresh_view(self):
+        """切换版本模式后重绘当前卡"""
+        if self.conn is not None and self.current_card:
+            self._show_card(self.current_card)
 
     def export_art(self):
         if not self.current_row:
@@ -1148,11 +1263,19 @@ class CardTab(ttk.Frame):
         if dlg.result is None:
             return
         img = dlg.result
-        n_res = len(cards.get_card_rows(self.conn, self.current_card))
+        # 同名同图的其它卡号（区域双建档）一并替换；异画像素不同不会命中
+        twins = cards.same_art_card_ids(self.app.paths, self.conn, self.current_card)
+        ids = [self.current_card] + twins
+        n_res = sum(len(cards.get_card_rows(self.conn, c)) for c in ids)
+        note = ""
+        if twins:
+            note = (f"\n另发现同名同图的卡号 {'、'.join(twins)}，会一并替换"
+                    f"（异画不包含在内）。")
         if not messagebox.askyesno(
                 "确认替换",
                 f"将用所选图片替换卡号 {self.current_card}（{self._get_name(self.current_card)}）的卡图。\n"
-                f"游戏中该卡的 {n_res} 个卡图资源会一并替换，原版文件自动备份（只备份一次），确定？"):
+                f"游戏中该卡的 {n_res} 个卡图资源会一并替换，原版文件自动备份（只备份一次）。"
+                f"{note}\n确定？"):
             return
         self.replace_btn.config(state=tk.DISABLED)
         self.info_var.set("替换中，请稍候...")
@@ -1165,7 +1288,8 @@ class CardTab(ttk.Frame):
             conn = cards.init_db()
             try:
                 return cards.replace_card_art(
-                    self.app.paths, self.app.get_manifest(), conn, cid, img)
+                    self.app.paths, self.app.get_manifest(), conn, cid, img,
+                    extra_ids=twins)
             finally:
                 conn.close()
 
@@ -1176,7 +1300,8 @@ class CardTab(ttk.Frame):
                 messagebox.showerror("替换失败", str(err))
                 return
             cards.invalidate_replaced_cache()
-            messagebox.showinfo("完成", f"卡图替换成功！共写入 {count} 个卡图资源。")
+            extra = f"（含同名同图卡号 {'、'.join(twins)}）" if twins else ""
+            messagebox.showinfo("完成", f"卡图替换成功！共写入 {count} 个卡图资源{extra}。")
             self.app.refresh_status()
             self.app.restore_tab.refresh()
             self.on_select(None)  # 刷新预览
@@ -1304,6 +1429,40 @@ class RestoreTab(ttk.Frame):
                            f"  |  排序: {sort_label.get(self._sort_col, self._sort_col)}"
                            f"{' 降序' if self._sort_reverse else ' 升序'}")
 
+    def _linked_rels(self, sels, manifest):
+        """把选中文件扩展到同一卡号的全部已改 Bundle（tcg/ocg、同路径重复版本）。
+        返回 (待还原 rel 列表, 联动数, 涉及卡数)；索引缺失时原样返回。"""
+        if not core.INDEX_DB.exists():
+            return list(sels), 0, 0
+        entries = manifest.entries()
+        try:
+            conn = cards.init_db()
+        except Exception:
+            return list(sels), 0, 0
+        try:
+            rel2cid = cards.rel_card_map(conn, list(entries.keys()))
+            cids = {rel2cid[r] for r in sels if r in rel2cid}
+            if not cids:
+                return list(sels), 0, 0
+            # 同名同图的其它卡号也一起联动（异画不命中）
+            for cid in list(cids):
+                cids.update(cards.same_art_card_ids(self.app.paths, conn, cid))
+            by_norm = {}
+            for key in entries:
+                full = key if key.split("/", 1)[0] in (core.ROOT_LOCAL, core.ROOT_STREAM) \
+                    else f"{core.ROOT_LOCAL}/{key}"
+                by_norm[full] = key
+            group = []
+            for cid in cids:
+                for row in cards.get_card_rows(conn, cid):
+                    key = by_norm.get(f"{row['root']}/{row['rel']}")
+                    if key:
+                        group.append(key)
+            merged = list(dict.fromkeys(list(sels) + group))
+            return merged, len(merged) - len(sels), len(cids)
+        finally:
+            conn.close()
+
     def restore_selected(self):
         if not self.app.check_game_closed():
             return
@@ -1311,11 +1470,18 @@ class RestoreTab(ttk.Frame):
         if not sels:
             messagebox.showinfo("提示", "请先勾选要还原的文件")
             return
-        if not messagebox.askyesno("确认", f"还原选中的 {len(sels)} 个文件？"):
-            return
         manifest = self.app.get_manifest()
+        targets, linked, n_cards = self._linked_rels(sels, manifest)
+        if linked:
+            q = (f"选中的 {len(sels)} 个文件属于 {n_cards} 张卡。\n"
+                 f"同卡的其他版本（tcg/ocg、重复 Bundle）将一并还原，"
+                 f"共 {len(targets)} 个文件。\n确定还原？")
+        else:
+            q = f"还原选中的 {len(sels)} 个文件？"
+        if not messagebox.askyesno("确认", q):
+            return
         ok, failed = 0, []
-        for rel in sels:
+        for rel in targets:
             try:
                 core.restore_one(self.app.paths, manifest, rel)
                 ok += 1
@@ -1325,6 +1491,8 @@ class RestoreTab(ttk.Frame):
         self.refresh()
         self.app.refresh_status()
         msg = f"已还原 {ok} 个文件。"
+        if linked:
+            msg += f"\n其中同卡联动还原 {linked} 个。"
         if failed:
             msg += f"\n{len(failed)} 个失败：\n" + "\n".join(failed[:5])
         messagebox.showinfo("完成", msg)

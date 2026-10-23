@@ -3,10 +3,17 @@ __pycache__/
 *.pyc
 *.pyo
 
+# 虚拟环境
+.venv/
+venv/
+env/
+
 # 打包产物
 build/
 dist/
 *.exe
+*.pkg
+*.pyz
 
 # 运行时生成的数据（每台机器本地生成，不进仓库）
 _MD卡图备份/
@@ -19,6 +26,27 @@ config.json
 # 本地 Mod 文件（他人作品/版权内容，禁止上传）
 mod下载文件/
 
-# IDE
+# IDE / 编辑器
 .idea/
 .vscode/
+.vs/
+*.swp
+*~
+
+# Windows 系统文件
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# 日志与临时文件
+*.log
+*.tmp
+*.bak
+*.orig
+
+# 测试 / 类型检查缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
