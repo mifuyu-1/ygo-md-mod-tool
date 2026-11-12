@@ -182,8 +182,12 @@ def save_game_names(game_root, out_path: Path) -> dict:
 
 if __name__ == "__main__":
     import sys
-    root = sys.argv[1] if len(sys.argv) > 1 else \
-        r"C:\Users\Administrator\Steam\steamapps\common\Yu-Gi-Oh!  Master Duel"
+
+    import core
+
+    root = Path(sys.argv[1]) if len(sys.argv) > 1 else core.detect_game_root()
+    if not root or not (Path(root) / "masterduel_Data").is_dir():
+        sys.exit("用法: python gamedata.py [游戏根目录]\n没有自动找到游戏目录，请显式指定。")
     r = extract_game_cards(root)
     print("卡片数:", r["count"], "密钥:", r["key"], "语言:", r["languages"])
     for cid in ("3001", "3167", "4007", "4041"):

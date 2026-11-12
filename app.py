@@ -13,6 +13,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import cards
 import core
+import overframe
 import UnityPy
 from PIL import Image, ImageTk
 from UnityPy.enums import ClassIDType
@@ -288,6 +289,15 @@ class App(tk.Tk):
         self.dir_var.set(str(root))
         self._update_game_state()
         self.refresh_status()
+        # 换游戏目录后，卡图列表/搜索/超框登记都来自旧目录，清掉按新目录重读
+        tab = self.card_tab
+        tab._search_idx = None
+        tab._over_ids = set()
+        tab._over_map = None
+        tab._modded_ids = set()
+        tab.current_card, tab.current_row = None, None
+        if tab.conn is not None:
+            tab._try_open_db()
         self.restore_tab.refresh()
 
     def get_manifest(self) -> core.Manifest:
@@ -326,7 +336,6 @@ class App(tk.Tk):
             self.status_var.set("请先设置游戏目录")
             return
         m = self.get_manifest().entries()
-        bak_count = len(list(self.paths.backup_dir.rglob("*"))) if self.paths.backup_dir.exists() else 0
         bak_files = sum(1 for f in self.paths.backup_dir.rglob("*") if f.is_file()) if self.paths.backup_dir.exists() else 0
         self.status_var.set(f"已备份 {bak_files} 个原版文件 | 当前 {len(m)} 个文件处于 mod 状态")
 
@@ -832,7 +841,9 @@ class CardTab(ttk.Frame):
         self.current_row = None   # 首选卡图资源 {root, rel, path_id,...}
         self.current_card = None
         self._lang = tk.StringVar(value="cn")  # 默认中文
-        self._search_idx = None  # [(card_id, pref_row, blob)] 全语言卡名+卡号，用于搜索
+        self._search_idx = None  # [(card_id, pref_row, blob, is_over)] 全语言卡名+卡号+超框
+        self._over_ids = set()   # 索引中标记为超框的卡号
+        self._over_map = None    # of_card_asset：{超框美术ID: 原图ID}，用于回退卡名
         self._modded_ids = set()
 
         top = ttk.Frame(self)
@@ -863,6 +874,13 @@ class CardTab(ttk.Frame):
         self.filter_modded = tk.BooleanVar(value=False)
         ttk.Checkbutton(sear, text="仅显示已替换", variable=self.filter_modded,
                         command=self.search).pack(side=tk.LEFT, padx=8)
+        # 筛选：卡图类型（超框美术是 512x1024 的 .png，普通卡图是 .bmp）
+        ttk.Label(sear, text="类型:").pack(side=tk.LEFT, padx=(2, 2))
+        self.over_filter = tk.StringVar(value="全部")
+        over_cb = ttk.Combobox(sear, textvariable=self.over_filter, state="readonly",
+                               values=["全部", "仅超框", "仅普通"], width=7)
+        over_cb.pack(side=tk.LEFT)
+        over_cb.bind("<<ComboboxSelected>>", lambda _e: self.search())
 
         body = ttk.Frame(self)
         body.pack(fill=tk.BOTH, expand=True, padx=8)
@@ -919,6 +937,8 @@ class CardTab(ttk.Frame):
         self.replace_btn.pack(side=tk.BOTTOM, fill=tk.X, pady=2)
         ttk.Button(right, text="导出当前卡图为 PNG",
                    command=self.export_art).pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 2))
+        ttk.Button(right, text="制作超框卡图（插图/卡框/主体）...",
+                   command=self.open_overframe).pack(side=tk.BOTTOM, fill=tk.X, pady=2)
         self._pv_cells, self._pv_labels, self._pv_caps = [], [], []
         for _i in range(2):
             cell = ttk.Frame(self.preview_box)
@@ -964,18 +984,23 @@ class CardTab(ttk.Frame):
             try:
                 self.conn = cards.init_db()
                 self._search_idx = None  # 索引可能重建过，搜索索引失效
+                self._over_map = None    # 超框登记表随之重读
                 self.search()
             except Exception:
                 self.conn = None
 
     def _build_search_index(self):
-        """构建内存搜索索引：[(card_id, pref_row, blob)]。
-        只含游戏已实装（CARD_Prop）且有卡图的卡，blob 含中/英/日卡名+卡号（小写）。"""
+        """构建内存搜索索引：[(card_id, pref_row, blob, is_over)]。
+        卡号 = 游戏已实装卡 + 超框专用美术 ID（后者常不在 CARD_Prop），
+        blob 含中/英/日卡名、卡号与“超框”标记。"""
+        if self._over_map is None:
+            self._over_map = cards.load_overframe_map(self.app.paths)
         idx = []
-        for cid in cards.official_card_ids(self.conn, self.ordered_ids):
+        for cid in cards.browse_card_ids(self.conn, self.ordered_ids):
             rows = cards.get_card_rows(self.conn, cid)
             if not rows:
                 continue
+            is_over = any(r["over"] for r in rows)
             parts = [cid]
             entry = self.names_full.get(cid)
             if entry:
@@ -987,8 +1012,19 @@ class CardTab(ttk.Frame):
                 old = self.names.get(cid)
                 if old:
                     parts.append(str(old).lower())
-            idx.append((cid, rows[0], " ".join(parts)))
+            if is_over:
+                parts.append("超框")
+                # 超框美术 ID 自身无卡名时，用登记表指回的原卡卡名，便于按卡名搜到
+                base = self._over_map.get(cid)
+                base_entry = self.names_full.get(base) if base else None
+                if base_entry:
+                    for lang in ("cn", "en", "ja"):
+                        n = base_entry.get(lang)
+                        if n:
+                            parts.append(n.lower())
+            idx.append((cid, rows[0], " ".join(parts), is_over))
         self._search_idx = idx
+        self._over_ids = {c for c, _p, _b, over in idx if over}
 
     def build_index(self):
         if not self.app.paths or not self.app.paths.data_dir:
@@ -1046,11 +1082,17 @@ class CardTab(ttk.Frame):
         kw = self.search_var.get().strip().lower()
         if self._search_idx is None:
             self._build_search_index()
-        # 关键词匹配：卡号 / 中文名 / 英文名 / 日文名（全部小写后子串匹配）
-        if kw:
-            rows = [(cid, pref) for cid, pref, blob in self._search_idx if kw in blob]
-        else:
-            rows = [(cid, pref) for cid, pref, _ in self._search_idx]
+        over_mode = self.over_filter.get()
+        # 关键词匹配：卡号 / 中文名 / 英文名 / 日文名 / 超框（全部小写后子串匹配）
+        rows = []
+        for cid, pref, blob, is_over in self._search_idx:
+            if kw and kw not in blob:
+                continue
+            if over_mode == "仅超框" and not is_over:
+                continue
+            if over_mode == "仅普通" and is_over:
+                continue
+            rows.append((cid, pref))
         # 已替换卡号集合（清单文件经索引反查，含 local/stream 两根）
         modded = self.app.get_manifest().entries() if self.app.paths else {}
         self._modded_ids = cards.get_modded_card_ids(self.conn, modded)
@@ -1075,19 +1117,43 @@ class CardTab(ttk.Frame):
         total_pages = max(1, (len(self._all_rows) - 1) // self._page_size + 1)
         self._goto_page(min(max(1, int(s)), total_pages) - 1)
 
+    @staticmethod
+    def _is_placeholder(name: str, cid: str) -> bool:
+        """游戏数据里部分 ID 的中文名是 "No.22768" 这类占位，视同无卡名"""
+        return not (name or "").strip() or name.strip() in (str(cid), f"No.{cid}")
+
+    def _name_of(self, cid, lang) -> str:
+        """取某卡号在指定语言的官方卡名，占位名视为空"""
+        entry = self.names_full.get(str(cid))
+        if not entry:
+            return ""
+        name = entry.get("ja" if lang == "jp" else lang) or ""
+        return "" if self._is_placeholder(name, cid) else name
+
     def _get_name(self, cid):
-        """按当前语言获取卡名（官方库语言键 cn/en/ja）"""
+        """按当前语言取卡名；当前语言是占位名时，超框先借登记表指回原卡的卡名，再退其它语言"""
         lang = self._lang.get()
-        entry = self.names_full.get(cid)
-        if entry:
-            key = "ja" if lang == "jp" else lang
-            name = entry.get(key, "")
+        order = [lang] + [l for l in ("cn", "en", "ja") if l != lang]
+        name = self._name_of(cid, lang)
+        if name:
+            return name
+        if cid in self._over_ids:
+            if self._over_map is None:
+                self._over_map = cards.load_overframe_map(self.app.paths)
+            base = self._over_map.get(cid)
+            if base:
+                for l in order:
+                    name = self._name_of(base, l)
+                    if name:
+                        return name
+        for l in order:
+            name = self._name_of(cid, l)
             if name:
                 return name
-            for l in ("cn", "en", "ja"):
-                if entry.get(l):
-                    return entry[l]
-        return self.names.get(cid, "")  # 回退到旧卡名库
+        old = self.names.get(cid)  # 回退到旧卡名库
+        if old:
+            return old
+        return f"超框卡图 {cid}" if cid in self._over_ids else ""
 
     def _on_lang_change(self):
         """切换语言：列表与右侧卡名刷新；和谐卡按语言切换 TCG/OCG 版本"""
@@ -1103,8 +1169,11 @@ class CardTab(ttk.Frame):
         self.tree.delete(*self.tree.get_children())
         for cid, _pref in rows[start:end]:
             is_mod = cid in self._modded_ids
+            name = self._get_name(cid)
+            if cid in self._over_ids:
+                name = f"{name}（超框）" if name else name
             self.tree.insert("", tk.END, values=(
-                cid, self._get_name(cid), "●已改" if is_mod else ""))
+                cid, name, "●已改" if is_mod else ""))
         self.page_var.set(f"第 {start+1}-{end} / {total} 张  (第 {self._page+1}/{(total-1)//self._page_size+1} 页)" if total else "无结果")
 
     def on_select(self, _evt=None):
@@ -1118,6 +1187,13 @@ class CardTab(ttk.Frame):
         （游戏按语言选择和谐版/原版：日语用 OCG，其余语言用 TCG）"""
         card_rows = self._sorted_rows(cards.get_card_rows(self.conn, cid))
         if not card_rows:
+            # 索引里没有这张卡：清空当前选择，避免替换/导出误作用到上一张卡
+            self.current_card, self.current_row = cid, None
+            self.name_var.set(self._get_name(cid))
+            self.info_var.set(f"卡号 {cid}\n索引里没有这张卡的卡图记录，请重建索引。")
+            for i, cell in enumerate(self._pv_cells):
+                cell.grid_remove()
+                self._pv_caps[i].config(text="")
             return
         rows = self._pick_rows(card_rows)
         self.current_card, self.current_row = cid, rows[0]
@@ -1207,7 +1283,8 @@ class CardTab(ttk.Frame):
             self._pv_caps[i].config(text=cap)
             try:
                 img = cards.read_card_art(self.app.paths, row["root"], row["rel"],
-                                          row["path_id"])
+                                          row["path_id"],
+                                          overframe=row.get("over", False))
             except Exception:
                 img = None
             if img is None:
@@ -1234,10 +1311,22 @@ class CardTab(ttk.Frame):
             filetypes=[("PNG 图片", "*.png")])
         if p:
             if cards.export_card_art(self.app.paths, row["root"], row["rel"],
-                                     Path(p), row["path_id"]):
+                                     Path(p), row["path_id"],
+                                     overframe=row.get("over", False)):
                 messagebox.showinfo("完成", f"已导出到 {p}")
             else:
                 messagebox.showerror("失败", "无法导出该卡图")
+
+    def open_overframe(self):
+        """打开超框卡图制作对话框（背景 / 卡框 / 主体 / 边框特效）"""
+        if not self.current_card or not self.current_row:
+            messagebox.showinfo("提示", "请先在左侧选择一张卡片")
+            return
+        if not self.app.check_game_closed():
+            return
+        import overframe_ui
+        overframe_ui.OverframeDialog(self, self.app, self.current_card,
+                                     self._get_name(self.current_card))
 
     def replace_art(self):
         if not self.current_row:
@@ -1256,9 +1345,15 @@ class CardTab(ttk.Frame):
         except Exception as e:
             messagebox.showerror("无法打开图片", str(e))
             return
-        # 弹出裁剪窗口：按目标卡图比例锁定框选（该卡所有资源尺寸一致）
+        # 弹出裁剪窗口：按目标卡图比例锁定框选（该卡所有资源尺寸一致）。
+        # 超框美术贴图按 704×1024 版式设计（官方压缩成 512×1024 存放），
+        # 裁剪统一按 704:1024 取；写入时再按每张贴图的原有尺寸缩放
         row = self.current_row
-        dlg = CropDialog(self, img, row["w"], row["h"])
+        was_over = overframe.is_registered(self.app.paths, self.current_card)
+        if row.get("over") or was_over:
+            dlg = CropDialog(self, img, cards.OVERFRAME_W, cards.OVERFRAME_H)
+        else:
+            dlg = CropDialog(self, img, row["w"], row["h"])
         self.wait_window(dlg)
         if dlg.result is None:
             return
@@ -1271,6 +1366,9 @@ class CardTab(ttk.Frame):
         if twins:
             note = (f"\n另发现同名同图的卡号 {'、'.join(twins)}，会一并替换"
                     f"（异画不包含在内）。")
+        if was_over:
+            note += "\n该卡当前是本工具制作的超框卡，替换的是整张卡图（704×1024），超框效果保留。"
+            note += "\n若想回到普通卡，请在「制作超框卡图」窗口点还原。"
         if not messagebox.askyesno(
                 "确认替换",
                 f"将用所选图片替换卡号 {self.current_card}（{self._get_name(self.current_card)}）的卡图。\n"
@@ -1488,11 +1586,31 @@ class RestoreTab(ttk.Frame):
             except OSError as e:
                 failed.append(f"{rel}: {e}")
         cards.invalidate_replaced_cache()
+        # 还原了超框卡：撤销登记并清掉编辑记录，否则预览还会带出旧素材
+        forgotten = 0
+        target_set = set(targets)
+        try:
+            saved = overframe.saved_cards()
+        except Exception:
+            saved = {}
+        for cid, ed in saved.items():
+            rels = set(ed.get("art_rels") or [])
+            if ed.get("art_rel"):
+                rels.add(ed["art_rel"])
+            if not (rels & target_set):
+                continue
+            try:
+                if overframe.forget(self.app.paths, manifest, int(cid)):
+                    forgotten += 1
+            except Exception:
+                pass
         self.refresh()
         self.app.refresh_status()
         msg = f"已还原 {ok} 个文件。"
         if linked:
             msg += f"\n其中同卡联动还原 {linked} 个。"
+        if forgotten:
+            msg += f"\n已同步取消 {forgotten} 张卡的超框登记。"
         if failed:
             msg += f"\n{len(failed)} 个失败：\n" + "\n".join(failed[:5])
         messagebox.showinfo("完成", msg)
@@ -1504,6 +1622,11 @@ class RestoreTab(ttk.Frame):
             return
         restored, deleted, failed = core.restore_all(self.app.paths, self.app.get_manifest())
         cards.invalidate_replaced_cache()
+        try:
+            for cid in overframe.saved_cards():
+                overframe.forget(self.app.paths, self.app.get_manifest(), int(cid))
+        except Exception:
+            pass
         self.refresh()
         self.app.refresh_status()
         msg = f"已还原 {restored} 个原版文件，删除 {deleted} 个新增文件。"

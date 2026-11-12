@@ -11,6 +11,8 @@ from pathlib import Path
 
 # 打包成 exe 后，__file__ 指向临时解压目录，必须用 exe 所在目录持久化配置/索引
 TOOL_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+# 随包资源（tools/overframe 等）：打包后位于 PyInstaller 解压目录 _MEIPASS
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 CONFIG_FILE = TOOL_DIR / "config.json"
 INDEX_DB = TOOL_DIR / "card_index.sqlite"
 CARDS_JSON = TOOL_DIR / "cards.json"  # 可选：卡号→卡名 {"18448": "青眼白龙", ...}

@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import sqlite3
+import struct
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -38,6 +39,9 @@ def init_db(db_path: Path = INDEX_DB) -> sqlite3.Connection:
         # v1 旧结构（无 root/path_id，按贴图名猜测)必须重建
         if "root" not in names or "path_id" not in names:
             conn.execute("DROP TABLE cards")
+        elif "over" not in names:
+            # 旧库补列：默认 0，重建索引后才有准确值
+            conn.execute("ALTER TABLE cards ADD COLUMN over INTEGER DEFAULT 0")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS cards(
             card_id TEXT NOT NULL,
@@ -45,6 +49,7 @@ def init_db(db_path: Path = INDEX_DB) -> sqlite3.Connection:
             rel_path TEXT NOT NULL,
             path_id INTEGER,
             width INT, height INT, format INT, mip INT, kind TEXT,
+            over INTEGER DEFAULT 0,
             PRIMARY KEY (card_id, root, rel_path, path_id)
         )
     """)
@@ -89,15 +94,19 @@ def _inspect_bundle(root: str, path: Path) -> list[tuple]:
                 t = ptr.read()
             except Exception:
                 continue
-            # 卡图只有 512x512（常规）与 512x1024（竖版完整卡图）两种
-            if t.m_Width != 512 or t.m_Height not in (512, 1024):
+            # 卡图只有 512x512（常规）、512x1024（竖版/压缩存放的超框）与
+            # 704x1024（本工具制作的超框整卡图，原生版式宽度）三种
+            if t.m_Width not in (512, 704) or t.m_Height not in (512, 1024):
                 continue
             cid = t.m_Name if getattr(t, "m_Name", "").isdigit() else stem
             if not cid.isdigit():
                 continue
+            # 超框美术：完整卡面，官方是 .png，本工具写入的是 704 宽整卡图
+            over = 1 if t.m_Height == 1024 and (
+                key.lower().endswith(".png") or t.m_Width >= 704) else 0
             rows.append((cid, root, rel, int(ptr.path_id),
                          t.m_Width, t.m_Height, int(t.m_TextureFormat),
-                         getattr(t, "m_MipCount", 0), kind))
+                         getattr(t, "m_MipCount", 0), kind, over))
     except Exception:
         pass
     return rows
@@ -121,7 +130,9 @@ def scan_index(paths: Paths, progress_cb=None, workers: int = 8) -> dict:
         nonlocal batch, found
         if batch:
             conn.executemany(
-                "INSERT OR REPLACE INTO cards VALUES (?,?,?,?,?,?,?,?,?)", batch)
+                "INSERT OR REPLACE INTO cards"
+                "(card_id,root,rel_path,path_id,width,height,format,mip,kind,over)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)", batch)
             found += len(batch)
             batch.clear()
 
@@ -160,10 +171,10 @@ def index_ready() -> bool:
 def get_card_rows(conn, card_id: str) -> list[dict]:
     """一张卡的全部卡图资源（可能跨根/多版本），按 根(local优先) 与 版本(common优先) 排序"""
     cur = conn.execute(
-        "SELECT root, rel_path, path_id, width, height, format, mip, kind "
+        "SELECT root, rel_path, path_id, width, height, format, mip, kind, over "
         "FROM cards WHERE card_id=?", (str(card_id),))
     rows = [dict(root=r[0], rel=r[1], path_id=r[2], w=r[3], h=r[4],
-                 fmt=r[5], mip=r[6], kind=r[7]) for r in cur.fetchall()]
+                 fmt=r[5], mip=r[6], kind=r[7], over=bool(r[8])) for r in cur.fetchall()]
     rows.sort(key=lambda r: (ROOT_RANK.get(r["root"], 9), KIND_RANK.get(r["kind"], 9)))
     return rows
 
@@ -179,6 +190,58 @@ def official_card_ids(conn, ordered_ids: list[str]) -> list[str]:
             "SELECT DISTINCT card_id FROM cards ORDER BY CAST(card_id AS INT)")]
     have = {r[0] for r in conn.execute("SELECT DISTINCT card_id FROM cards")}
     return [cid for cid in ordered_ids if cid in have]
+
+
+def browse_card_ids(conn, ordered_ids: list[str]) -> list[str]:
+    """浏览列表用：已实装卡 + 索引里的超框专用 ID（后者常不在 CARD_Prop）。
+    不含其它未实装条目，避免列表膨胀。"""
+    base = official_card_ids(conn, ordered_ids)
+    try:
+        over_ids = {r[0] for r in conn.execute(
+            "SELECT DISTINCT card_id FROM cards WHERE over=1")}
+    except sqlite3.OperationalError:
+        return base
+    known = set(base)
+    extra = sorted((c for c in over_ids if c not in known), key=lambda x: int(x))
+    return base + extra
+
+
+# ---------------- 超框登记表 ----------------
+
+# of_card_asset 所在的 gate bundle（游戏更新后 ID 可能变化，找不到就返回空表）
+GATE_KNOWN_IDS = ("99f84cce",)
+
+
+def load_overframe_map(paths: Paths) -> dict:
+    """读取 of_card_asset：{超框美术ID: 原图ID}。用于把超框 ID 关联到原卡名。"""
+    if not paths or not paths.data_dir:
+        return {}
+    gate = None
+    for gid in GATE_KNOWN_IDS:
+        cand = paths.data_dir / gid[:2] / gid
+        if cand.is_file():
+            gate = cand
+            break
+    if gate is None:
+        return {}
+    try:
+        env = UnityPy.load(str(gate))
+        for o in env.objects:
+            if o.type.name != "TextAsset":
+                continue
+            d = o.read()
+            if d.m_Name != "of_card_asset":
+                continue
+            raw = d.m_Script
+            if isinstance(raw, str):
+                raw = raw.encode("utf-8", "surrogateescape")
+            raw = bytes(raw)
+            return {str(struct.unpack_from("<H", raw, i)[0]):
+                    str(struct.unpack_from("<H", raw, i + 2)[0])
+                    for i in range(0, len(raw) - 3, 4)}
+    except Exception:
+        pass
+    return {}
 
 
 # ---------------- 卡名库 ----------------
@@ -287,21 +350,38 @@ def _find_texture(env, path_id: int):
     return None
 
 
-def read_card_art(paths: Paths, root: str, rel: str, path_id: int | None = None):
-    """从指定根目录读取卡图（用于预览）"""
+# 超框美术的实际版式是 704×1024（与卡片比例一致）。官方贴图横向压缩成 512×1024 存放；
+# 本工具写入的超框贴图保持 704×1024。预览/导出一律按 704×1024 还原，否则整张卡会被压扁
+OVERFRAME_W, OVERFRAME_H = 704, 1024
+
+
+def read_card_art(paths: Paths, root: str, rel: str, path_id: int | None = None,
+                  overframe: bool = False):
+    """从指定根目录读取卡图（用于预览）。
+    overframe=True 用于超框美术，需按游戏内展示还原两点：
+      1) alpha 是游戏端合成用遮罩（框外溢出部分/效果框延续），不是透明度 → 置为不透明；
+      2) 官方贴图把 704×1024 横向压缩成 512×1024 存放 → 拉伸回卡片比例，否则看起来被压扁"""
     base = paths.data_dir if root == ROOT_LOCAL else paths.stream_dir
     bundle = base / rel
     if not bundle.exists():
         return None
     env = UnityPy.load(str(bundle))
+    img = None
     if path_id is not None:
         tex = _find_texture(env, int(path_id))
         if tex is not None:
-            return tex.image
-    for obj in env.objects:
-        if obj.type == ClassIDType.Texture2D:
-            return obj.read().image
-    return None
+            img = tex.image
+    if img is None:
+        for obj in env.objects:
+            if obj.type == ClassIDType.Texture2D:
+                img = obj.read().image
+                break
+    if img is not None and overframe:
+        img = img.convert("RGBA")
+        img.putalpha(255)
+        if img.size != (OVERFRAME_W, OVERFRAME_H):
+            img = img.resize((OVERFRAME_W, OVERFRAME_H), Image.LANCZOS)
+    return img
 
 
 # ---------------- 同名同图卡号（区域双建档） ----------------
@@ -334,7 +414,8 @@ def _bundle_pixel_md5(path: Path, path_id: int | None) -> str | None:
             if path_id is not None and obj.path_id != path_id:
                 continue
             t = obj.read()
-            if t.m_Width != 512 or t.m_Height not in (512, 1024):
+            # 普通卡图 512×512；官方超框压缩存放 512×1024；本工具写入的超框是 704×1024
+            if (t.m_Width, t.m_Height) not in ((512, 512), (512, 1024), (704, 1024)):
                 continue
             return hashlib.md5(t.image.convert("RGBA").tobytes()).hexdigest()
     except Exception:
@@ -441,9 +522,9 @@ def replace_card_art(paths: Paths, manifest: Manifest, conn, card_id: str,
 
 
 def export_card_art(paths: Paths, root: str, rel: str, out_path: Path,
-                    path_id: int | None = None) -> bool:
-    """导出当前卡图为 PNG"""
-    img = read_card_art(paths, root, rel, path_id)
+                    path_id: int | None = None, overframe: bool = False) -> bool:
+    """导出当前卡图为 PNG（overframe=True 用于超框美术：去 alpha 遮罩并还原 704×1024 比例）"""
+    img = read_card_art(paths, root, rel, path_id, overframe=overframe)
     if img is None:
         return False
     img.save(out_path)

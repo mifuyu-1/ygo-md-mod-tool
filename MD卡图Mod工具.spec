@@ -6,8 +6,10 @@ from PyInstaller.utils.hooks import collect_all
 SPEC_DIR = SPECPATH
 
 datas = []
+# 超框卡图制作的卡框/边框素材（随包分发）
+datas.append((os.path.join(SPEC_DIR, 'tools'), 'tools'))
 binaries = []
-hiddenimports = []
+hiddenimports = ['overframe', 'overframe_ui']
 tmp_ret = collect_all('UnityPy')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('texture2ddecoder')

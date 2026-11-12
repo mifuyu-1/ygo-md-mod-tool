@@ -17,6 +17,7 @@ dist/
 
 # 运行时生成的数据（每台机器本地生成，不进仓库）
 _MD卡图备份/
+overframe/
 card_index.sqlite
 game_card_names.json
 card_names_full.json
